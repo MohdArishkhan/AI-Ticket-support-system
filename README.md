@@ -1,87 +1,98 @@
-<div align="center">
+# AI Support Ticket Triage
 
-# 🎫 AI Support Ticket Triage
+An n8n workflow that uses an LLM to classify support tickets, validates the
+model response, and safely routes each ticket to the correct internal queue.
 
-**An n8n + LLM workflow that classifies support tickets, validates every model output, and routes anything risky or uncertain to a human.**
+The workflow is designed around one principle:
 
-*The model makes one bounded decision. Code makes the safety calls. Nothing customer-facing ever happens automatically.*
+> The model makes a bounded classification decision. Code enforces the safety
+> rules, and uncertain or risky tickets are sent for human review.
 
-[![Built with n8n](https://img.shields.io/badge/Built%20with-n8n-EA4B71?style=flat-square)](https://n8n.io)
-[![OpenRouter](https://img.shields.io/badge/LLM-OpenRouter-8A63D2?style=flat-square)](https://openrouter.ai)
-![Structured output](https://img.shields.io/badge/output-validated%20JSON-2EA44F?style=flat-square)
-![Human in the loop](https://img.shields.io/badge/human--in--the--loop-enforced-F59E0B?style=flat-square)
-![Status](https://img.shields.io/badge/status-v1%20test%20ready-0EA5E9?style=flat-square)
+## Table of Contents
 
-</div>
-
----
+- [Overview](#overview)
+- [Workflow](#workflow)
+- [Classification Contract](#classification-contract)
+- [Validation and Safety Rules](#validation-and-safety-rules)
+- [Routes](#routes)
+- [Setup](#setup)
+- [Testing](#testing)
+- [Project Structure](#project-structure)
+- [Limitations and Roadmap](#limitations-and-roadmap)
+- [Author](#author)
 
 ## Overview
 
-Support teams lose time sorting tickets by hand, but letting an LLM act on tickets directly is risky: it can misread a legal threat, invent a category, or return output that silently breaks the next step.
+Support teams often spend significant time sorting tickets manually. Sending
+tickets directly to an LLM without safeguards can also create problems, such
+as invalid categories, malformed output, or unsafe automatic decisions.
 
-This workflow puts the LLM inside guardrails:
+This workflow addresses those problems by:
 
-- **One job for the model:** classify a ticket into a fixed JSON contract.
-- **Code checks everything:** schema, allowed categories, confidence range.
-- **Hard-coded overrides:** high risk or low confidence always goes to a human, whatever the model says.
-- **Every path is logged:** success, error, review and duplicate runs all end in the same persisted log entry.
+- Sending one classification request to an OpenRouter LLM.
+- Requiring a fixed JSON response format.
+- Validating the response in n8n Code nodes.
+- Detecting duplicate `request_id` values.
+- Rejecting empty or missing ticket messages before calling the LLM.
+- Sending high-risk and low-confidence results to human review.
+- Persisting a structured log for every completed path.
 
-Built during my **AI Automations internship at DevelopersHub Corporation** (2026).
+The workflow only performs internal tagging and routing. It does not send
+customer replies, issue refunds, cancel services, or perform other irreversible
+customer-facing actions.
 
-<p align="center">
-  <img src="./System%20Screenshots/Ticket%20Triage%20System%20(Duplicate%20Queries).png" width="100%" alt="n8n workflow: duplicate check, input guard, LLM, validation, routing and persistence">
-</p>
-
----
-
-## Architecture
-
-| Part | Implementation |
-|---|---|
-| **Trigger** | Manual execution (v0/v1). Webhook planned for v2 |
-| **Context** | `{ request_id, received_at, message }` |
-| **Decision** | One bounded LLM call: category, confidence, summary, risk |
-| **Action** | Internal tagging and queue routing only, never a customer-facing action |
-| **State** | A full log entry per ticket on every path |
-| **Control** | Human review gate, plus the workflow can be paused at platform level |
-
-### Pipeline
-
-```
-01 Trigger
-   ↓
-02c Duplicate Check ── duplicate ──────────────▶ Tag: duplicate ─────┐
-   ↓                                                                 │
-02 Set fields  (request_id, received_at, message)                    │
-   ↓                                                                 │
-02b Input Guard ── invalid ────────────────────▶ Tag: error ─────────┤
-   ↓                                                                 │
-03 LLM  (contract prompt, JSON only, via OpenRouter)                 │
-   ↓                                                                 │
-04 Parse + validate ── invalid ────────────────▶ Tag: error ─────────┤
-   ↓                                                                 │
-05 Route ──▶ Tag: human_review  /  Tag: auto_tagged ─────────────────┤
-                                                                     ▼
-                                                               06 Persist
-```
-
----
-
-## The contract prompt
-
-Every LLM call follows a **JOB / CONTEXT / RULES / TOOLS / OUTPUT / CHECK** contract:
+## Workflow
 
 ```text
-JOB:     Classify one support ticket into a routing decision.
-CONTEXT: Free-text customer message. Allowed categories: billing, technical, account, spam, other.
-RULES:   Return ONLY valid JSON. No markdown fences. No prose. Never invent a category.
-TOOLS:   None. Classification only, no external action.
-OUTPUT:  { category, confidence, summary, risk, needs_human }
-CHECK:   Valid JSON · known category · confidence 0–1 · non-empty summary.
+01 Trigger
+    ↓
+02 Set fields
+    ↓
+02c Duplicate Check
+    ├── Duplicate → Tag: duplicate → 06 Persist
+    └── New ticket
+          ↓
+    02b Input Guard
+          ├── Invalid message → Tag: error → 06 Persist
+          └── Valid message
+                ↓
+          03 LLM (OpenRouter)
+                ↓
+          04 Parse + validate
+                ↓
+          05 Route
+                ├── Invalid/API failure → Tag: error
+                ├── Risky/uncertain → Tag: human_review
+                └── Valid/safe → Tag: auto_tagged
+                                      ↓
+                                  06 Persist
 ```
 
-### Output schema
+### Workflow stages
+
+| Stage | Node | Responsibility |
+| --- | --- | --- |
+| 1 | `01 Trigger` | Starts the workflow. The current version uses a manual trigger. |
+| 2 | `02 Set fields` | Creates `request_id`, `received_at`, and `message`. |
+| 3 | `02c Duplicate Check` | Checks whether the request ID has already been processed. |
+| 4 | `02b Input Guard` | Rejects an empty or missing message. |
+| 5 | `03 LLM` | Sends the ticket to OpenRouter for classification. |
+| 6 | `04 Parse + validate` | Parses and validates the model response. |
+| 7 | `05 Route` | Selects the error, human review, or automatic tagging path. |
+| 8 | `06 Persist` | Creates the final log entry. |
+
+## Classification Contract
+
+The LLM receives a structured contract containing:
+
+- **Job:** Classify one support ticket.
+- **Context:** A free-text customer message.
+- **Allowed categories:** `billing`, `technical`, `account`, `spam`, `other`.
+- **Rules:** Return JSON only and never invent a category.
+- **Tools:** None. The model only classifies the ticket.
+- **Output:** A fixed set of fields.
+
+### Expected output
 
 ```json
 {
@@ -93,116 +104,144 @@ CHECK:   Valid JSON · known category · confidence 0–1 · non-empty summary.
 }
 ```
 
-| Field | Type | Allowed values |
-|---|---|---|
-| `category` | string | `billing` · `technical` · `account` · `spam` · `other` |
-| `confidence` | number | `0.0` – `1.0` |
-| `summary` | string | non-empty, short |
-| `risk` | string | `low` · `medium` · `high` |
-| `needs_human` | boolean | |
+| Field | Type | Allowed values or requirements |
+| --- | --- | --- |
+| `category` | string | `billing`, `technical`, `account`, `spam`, or `other` |
+| `confidence` | number | Between `0.0` and `1.0` |
+| `summary` | string | Must be non-empty |
+| `risk` | string | `low`, `medium`, or `high` |
+| `needs_human` | boolean | Indicates whether human review is required |
 
----
+## Validation and Safety Rules
 
-## Guardrails
+Validation is implemented in the n8n Code node named `04 Parse + validate`.
+The code is embedded in the workflow JSON rather than stored in a separate
+JavaScript file.
 
-### Validation rules (enforced in code, not by the model)
+The workflow:
 
-1. `category` must be in the allowed list.
-2. `confidence` must be a number between 0 and 1.
-3. `summary` must be present and non-empty.
-4. `risk = "high"` **forces** `needs_human = true`.
-5. `confidence < 0.6` **forces** `needs_human = true`.
-6. Unparseable JSON goes to the **error** path and is never guessed.
+1. Checks for API errors and timeouts.
+2. Reads the model response from `choices[0].message.content`.
+3. Removes optional Markdown code fences around JSON.
+4. Parses the response with `JSON.parse()`.
+5. Checks that all required fields are present.
+6. Checks the category against the allowed category list.
+7. Checks that confidence is a number from `0` to `1`.
+8. Checks that the summary is non-empty.
+9. Checks the risk value against the allowed risk list.
+10. Forces `needs_human` to `true` when:
+    - `risk` is `high`, or
+    - `confidence` is below `0.6`.
 
-### Failure handling
+Invalid responses are preserved with an error message and routed to the
+`error` path. The workflow never guesses a replacement value for invalid model
+output.
 
-| Failure | Handling |
-|---|---|
-| Empty or missing `message` | Caught by the Input Guard before the LLM is called |
-| JSON wrapped in markdown fences | Fences stripped in code before parsing |
-| Invalid JSON from the model | Routed to `error` with the raw output preserved |
-| Unknown category | Fails validation and goes to review |
-| Low confidence or high risk | Forced to `human_review` |
-| API failure or timeout | `continueOnFail` with a 15 s timeout, logged as a system error |
-| Repeated `request_id` | Detected via workflow static data, tagged `duplicate`, LLM never called |
+## Routes
 
-### Human approval boundary
+| Route | Condition | Result |
+| --- | --- | --- |
+| `duplicate_skipped` | The `request_id` was already processed | The LLM is not called. |
+| `error` | Input, API, parsing, or validation failure | The error is logged. |
+| `human_review` | High risk, low confidence, or model-requested review | A human reviews the ticket. |
+| `auto_tagged` | Valid result that does not require review | The ticket is routed to its category queue. |
 
-> The system **never** replies to a customer, refunds, cancels or takes any irreversible action.
-> Its only autonomous action is internal tagging and routing.
-> Anything uncertain or risky waits at `human_review`, and the model cannot override that.
-
----
-
-## Testing
-
-Five test cases, each aimed at a different failure mode. Full details are in [`Test Case README.md`](./Test%20Case%20README.md), and inputs and logs are in [`Testcases/`](./Testcases) and [`Output/`](./Output).
-
-| # | Scenario | Input | Expected | Observed |
-|---|---|---|---|---|
-| T1 | Happy path | `I was charged twice this month for my subscription.` | `auto_tagged` · billing | `human_review` · billing, conf 0.95. The model rated risk *medium* and set `needs_human: true` |
-| T2 | Vague ticket | `it's not working, please help` | `human_review` | ✅ `human_review` · technical, conf 0.60 |
-| T3 | Legal threat | `I'm contacting my lawyer about this fraudulent charge.` | `human_review` (high-risk override) | ✅ `human_review` · billing, risk high, conf 0.95 |
-| T4 | Empty message | *(empty)* | `error` | ✅ `error`: *missing or empty message field*, LLM not called |
-| T5 | Duplicate | Same `request_id` as T1 | `duplicate` | Duplicate check implemented in `..._v1_duplicate _queries.json` |
-
-<details>
-<summary><b>Sample log entry (T3, high-risk override)</b></summary>
-
-<p align="center"><img src="./Output/Test%20Case%2003%20Output%20(Log).png" width="380" alt="T3 log entry"></p>
-</details>
-
-### Issues found and fixed during testing
-
-| Issue | Cause | Fix |
-|---|---|---|
-| `Invalid JSON from model` on a clean input | The model wrapped valid JSON in markdown fences | Fence stripping added to `04 Parse + validate` before `JSON.parse()` |
-| `raw_output` showing `null` in the log | The Set node's *Include Other Input Fields* was off on the Tag nodes, silently dropping fields | Enabled `includeOtherFields: true` on every Tag node |
-
-**Finding from T1:** the model is more conservative than expected. It flags billing disputes as medium risk and asks for a human. That is a safe failure, not a dangerous one, and the next step is to tune the prompt's risk definitions so routine billing tickets can be auto-tagged.
-
----
+All routes converge at `06 Persist`, which records the request ID, timestamp,
+model output, route, queue, and error details.
 
 ## Setup
 
-1. **Import:** in n8n, go to *Workflows → Import from File* and choose `checkpoint01_ticket_triage_v1_duplicate _queries.json` (the full version).
-2. **Credential:** create a *Header Auth* credential with header `Authorization` and value `Bearer <your_openrouter_api_key>`.
-3. **Attach** the credential to the `03 LLM` node.
-4. **Model:** the request body uses `anthropic/claude-sonnet-4.5`. Any OpenRouter model slug works.
-5. **Run:** edit `02 Set fields` with a `request_id` and `message`, then click *Execute Workflow*.
+### Requirements
 
----
+- An n8n instance.
+- An OpenRouter API key.
+- Access to an OpenRouter model.
 
-## Repository structure
+### Import the workflow
 
-```
+1. Open n8n.
+2. Go to **Workflows → Import from File**.
+3. Import the full workflow:
+   `checkpoint01_ticket_triage_v1_duplicate _queries.json`.
+4. Open the `03 LLM` node.
+5. Create or select an n8n **Header Auth** credential:
+   - Header name: `Authorization`
+   - Header value: `Bearer <your_openrouter_api_key>`
+6. Attach the credential to the `03 LLM` node.
+7. Open `02 Set fields` and edit the ticket values.
+8. Execute the workflow.
+
+The default model is `anthropic/claude-sonnet-4.5`. You can replace it with
+another model slug supported by OpenRouter.
+
+## Testing
+
+The project includes five test cases covering normal processing and failure
+handling. See [Test Case README.md](./Test%20Case%20README.md) for the complete
+test plan.
+
+| Test | Scenario | Expected result |
+| --- | --- | --- |
+| T1 | Duplicate billing charge | `auto_tagged` with category `billing` |
+| T2 | Vague ticket | `human_review` because confidence is low |
+| T3 | Legal or fraud-related threat | `human_review` because risk is high |
+| T4 | Empty message | `error`; the LLM is not called |
+| T5 | Reused request ID | `duplicate_skipped`; the LLM is not called |
+
+T5 must be run after T1 with the same `request_id`, because duplicate detection
+uses workflow static data.
+
+### Test data and evidence
+
+- Inputs: [`Testcases/`](./Testcases/)
+- Output screenshots: [`Output/`](./Output/)
+- Workflow screenshots: [`System Screenshots/`](./System%20Screenshots/)
+
+## Project Structure
+
+```text
 AI-Support-Ticket-Triage/
-├── checkpoint01_ticket_triage_v0_happy_path.json        # v0: straight-line happy path (6 nodes)
-├── checkpoint01_ticket_triage_v1_openrouter.json        # v1: input guard, validation, error paths
-├── checkpoint01_ticket_triage_v1_duplicate _queries.json # v1 + duplicate detection (full version)
-├── Testcases/                                           # Inputs and logs for T1–T5
-├── Output/                                              # Log screenshots for each test case
-├── System Screenshots/                                  # Workflow and flowchart screenshots
-├── Test Case README.md                                  # Test plan and findings
-└── README.md
+├── checkpoint01_ticket_triage_v0_happy_path.json
+├── checkpoint01_ticket_triage_v1_openrouter.json
+├── checkpoint01_ticket_triage_v1_duplicate _queries.json
+├── Test Case README.md
+├── Testcases/
+│   ├── README.md
+│   └── Test_Case_01.json ... Test_Case_05.json
+├── Output/
+└── System Screenshots/
 ```
 
----
+### Workflow versions
 
-## Limitations and roadmap
+- `checkpoint01_ticket_triage_v0_happy_path.json`: Basic happy-path workflow.
+- `checkpoint01_ticket_triage_v1_openrouter.json`: Validation and error-path
+  workflow.
+- `checkpoint01_ticket_triage_v1_duplicate _queries.json`: Full version with
+  duplicate detection. This is the recommended workflow to import.
 
-- **Duplicate check** uses n8n workflow static data, which is in-memory. A real database is needed for production.
-- **Trigger** is manual. A webhook or form trigger is planned for v2.
-- **No customer-facing actions**, by design.
+## Limitations and Roadmap
 
-**Next:** webhook trigger · database-backed dedupe and logging · prompt tuning for risk levels · evaluation on a larger labeled ticket set
+- Duplicate detection currently uses n8n workflow static data and is not a
+  database-backed solution.
+- The workflow currently uses a manual trigger.
+- Logging is represented by the `06 Persist` node and should be connected to a
+  durable database or logging service for production use.
+- No customer-facing actions are performed by design.
 
----
+Planned improvements:
+
+- Add a webhook or form trigger.
+- Use a database for duplicate detection and persistent logging.
+- Tune risk definitions for routine billing tickets.
+- Evaluate the workflow against a larger labeled ticket dataset.
 
 ## Author
 
-**Hafsa Anwar**, AI & Automation Engineer · BS Robotics & Intelligence Systems, Bahria University
+**Hafsa Anwar**  
+AI & Automation Engineer  
+BS Robotics & Intelligence Systems, Bahria University
 
-[Portfolio](https://hafsaanwar.dev) · [LinkedIn](https://www.linkedin.com/in/hafsa-anwar-53b251313/) · [GitHub](https://github.com/Hafsa-Anwar65)
-#   A I - T i c k e t - s u p p o r t - s y s t e m  
- 
+- [Portfolio](https://hafsaanwar.dev)
+- [LinkedIn](https://www.linkedin.com/in/hafsa-anwar-53b251313/)
+- [GitHub](https://github.com/Hafsa-Anwar65)
