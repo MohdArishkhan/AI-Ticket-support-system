@@ -238,10 +238,4 @@ Planned improvements:
 
 ## Author
 
-**Hafsa Anwar**  
-AI & Automation Engineer  
-BS Robotics & Intelligence Systems, Bahria University
-
-- [Portfolio](https://hafsaanwar.dev)
-- [LinkedIn](https://www.linkedin.com/in/hafsa-anwar-53b251313/)
-- [GitHub](https://github.com/Hafsa-Anwar65)
+**Mohd Arish Khan**  
